@@ -1321,11 +1321,13 @@ func (kl *Kubelet) initializeModules() error {
 	metrics.SetNodeName(kl.nodeName)
 	servermetrics.Register()
 
+	// 创建文件目录
 	// Setup filesystem directories.
 	if err := kl.setupDataDirs(); err != nil {
 		return err
 	}
 
+	// 创建容器日志 /var/log/containers 目录
 	// If the container logs directory does not exist, create it.
 	if _, err := os.Stat(ContainerLogsDir); err != nil {
 		if err := kl.os.MkdirAll(ContainerLogsDir, 0755); err != nil {
@@ -1333,14 +1335,17 @@ func (kl *Kubelet) initializeModules() error {
 		}
 	}
 
+	// 启动 imageManager
 	// Start the image manager.
 	kl.imageManager.Start()
 
+	// 启动 CertificateManager ，证书相关
 	// Start the certificate manager if it was enabled.
 	if kl.serverCertificateManager != nil {
 		kl.serverCertificateManager.Start()
 	}
 
+	// 启动 oom watcher
 	// Start out of memory watcher.
 	if kl.oomWatcher != nil {
 		if err := kl.oomWatcher.Start(kl.nodeRef); err != nil {
@@ -1348,6 +1353,7 @@ func (kl *Kubelet) initializeModules() error {
 		}
 	}
 
+	// 启动 resource analyzer,刷新volume stats到缓存中
 	// Start resource analyzer
 	kl.resourceAnalyzer.Start()
 
@@ -1401,6 +1407,7 @@ func (kl *Kubelet) initializeRuntimeDependentModules() {
 
 // Run starts the kubelet reacting to config updates
 func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
+	// 注册 logServer
 	if kl.logServer == nil {
 		kl.logServer = http.StripPrefix("/logs/", http.FileServer(http.Dir("/var/log/")))
 	}
@@ -1408,17 +1415,20 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 		klog.InfoS("No API server defined - no node status update will be sent")
 	}
 
+	// Cloud Provider 扩展相关。当 Kubernetes 集群运行在云平台内部时，Cloud Provider 使得 Kubernetes 可以直接利用云平台实现持久化卷、负载均衡、网络路由、DNS 解析以及横向扩展等功能。
 	// Start the cloud provider sync manager
 	if kl.cloudResourceSyncManager != nil {
 		go kl.cloudResourceSyncManager.Run(wait.NeverStop)
 	}
 
+	// 首先启动不依赖 controller runtime 的模块
 	if err := kl.initializeModules(); err != nil {
 		kl.recorder.Eventf(kl.nodeRef, v1.EventTypeWarning, events.KubeletSetupFailed, err.Error())
 		klog.ErrorS(err, "Failed to initialize internal modules")
 		os.Exit(1)
 	}
 
+	// 启动 volume manager
 	// Start volume manager
 	go kl.volumeManager.Run(kl.sourcesReady, wait.NeverStop)
 
@@ -1426,19 +1436,25 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 		// Introduce some small jittering to ensure that over time the requests won't start
 		// accumulating at approximately the same time from the set of nodes due to priority and
 		// fairness effect.
+		// 定时同步 Node 状态。立即开始同步节点状态，这可能会设置运行时需要运行的内容
 		go wait.JitterUntil(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, 0.04, true, wait.NeverStop)
+		// 更新容器运行时启动时间以及执行首次状态同步.FastStatusUpdateOnce 函数启动一个循环，在应用CIDR时检查内部节点索引器缓存，并尝试立即更新POD CIDR。更新pod CIDR后，它会触发运行时更新和节点状态更新。函数在一次成功的节点状态更新后直接返回。该功能仅在 kubelet 启动期间执行，通过尽快更新 pod cidr、运行时状态和节点状态来提高准备就绪节点的延迟。
 		go kl.fastStatusUpdateOnce()
 
 		// start syncing lease
+		// NodeLease 机制。NodeLease: Kubelet 使用新的 Lease API 报告节点心跳，节点生命周期控制器使用这些心跳作为节点健康信号。开始同步 lease
 		go kl.nodeLeaseController.Run(wait.NeverStop)
 	}
+	// 定时更新 Runtime 的状态
 	go wait.Until(kl.updateRuntimeUp, 5*time.Second, wait.NeverStop)
 
+	// 定时同步 iptables 规则
 	// Set up iptables util rules
 	if kl.makeIPTablesUtilChains {
 		kl.initNetworkUtil()
 	}
 
+	//启动 statusManager、probeManager、runtimeClassManager
 	// Start component sync loops.
 	kl.statusManager.Start()
 
@@ -1447,6 +1463,7 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 		kl.runtimeClassManager.Start(wait.NeverStop)
 	}
 
+	// 启动 pleg 该模块主要用于周期性地向 container runtime 刷新当前所有容器的状态
 	// Start the pod lifecycle event generator.
 	kl.pleg.Start()
 	kl.syncLoop(updates, kl)
